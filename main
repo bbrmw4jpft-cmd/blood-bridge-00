@@ -1,0 +1,572 @@
+Main Backend Files
+1. .env file:
+
+env
+PORT=5000
+MONGODB_URI=mongodb+srv://username:password@cluster.mongodb.net/blooddonor
+JWT_SECRET=your_super_secret_jwt_key_here
+JWT_EXPIRE=7d
+
+# Email Configuration
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_email@gmail.com
+SMTP_PASS=your_app_password
+
+# SMS Configuration (Twilio)
+TWILIO_ACCOUNT_SID=your_twilio_sid
+TWILIO_AUTH_TOKEN=your_twilio_token
+TWILIO_PHONE_NUMBER=+1234567890
+
+# Google Maps API
+GOOGLE_MAPS_API_KEY=your_google_maps_key
+2. src/config/database.js:
+
+javascript
+const mongoose = require('mongoose');
+
+const connectDB = async () => {
+    try {
+        const conn = await mongoose.connect(process.env.MONGODB_URI);
+        console.log(`MongoDB Connected: ${conn.connection.host}`);
+    } catch (error) {
+        console.error(`Error: ${error.message}`);
+        process.exit(1);
+    }
+};
+
+module.exports = connectDB;
+3. src/models/Donor.js:
+
+javascript
+const mongoose = require('mongoose');
+
+const donorSchema = new mongoose.Schema({
+    name: {
+        type: String,
+        required: [true, 'Please add a name']
+    },
+    email: {
+        type: String,
+        required: [true, 'Please add an email'],
+        unique: true,
+        lowercase: true
+    },
+    phone: {
+        type: String,
+        required: [true, 'Please add a phone number']
+    },
+    password: {
+        type: String,
+        required: [true, 'Please add a password'],
+        minlength: 6
+    },
+    bloodGroup: {
+        type: String,
+        required: true,
+        enum: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+    },
+    age: {
+        type: Number,
+        required: true,
+        min: 18,
+        max: 65
+    },
+    weight: {
+        type: Number,
+        required: true,
+        min: 50
+    },
+    lastDonation: {
+        type: Date
+    },
+    location: {
+        type: {
+            type: String,
+            enum: ['Point'],
+            default: 'Point'
+        },
+        coordinates: {
+            type: [Number], // [longitude, latitude]
+            index: '2dsphere'
+        }
+    },
+    address: {
+        street: String,
+        city: String,
+        state: String,
+        zipCode: String
+    },
+    isAvailable: {
+        type: Boolean,
+        default: true
+    },
+    isVerified: {
+        type: Boolean,
+        default: false
+    },
+    healthConditions: [String],
+    medications: [String],
+    preferredContactMethod: {
+        type: String,
+        enum: ['sms', 'email', 'call'],
+        default: 'sms'
+    },
+    emergencyContact: {
+        name: String,
+        phone: String,
+        relationship: String
+    },
+    createdAt: {
+        type: Date,
+        default: Date.now
+    }
+});
+
+// Create geospatial index for location-based queries
+donorSchema.index({ location: '2dsphere' });
+
+module.exports = mongoose.model('Donor', donorSchema);
+4. src/models/Request.js:
+
+javascript
+const mongoose = require('mongoose');
+
+const requestSchema = new mongoose.Schema({
+    requestId: {
+        type: String,
+        unique: true,
+        default: () => `REQ${Date.now()}${Math.floor(Math.random() * 1000)}`
+    },
+    patientName: {
+        type: String,
+        required: true
+    },
+    hospitalName: {
+        type: String,
+        required: true
+    },
+    bloodGroup: {
+        type: String,
+        required: true,
+        enum: ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+    },
+    unitsRequired: {
+        type: Number,
+        required: true,
+        min: 1,
+        max: 10
+    },
+    urgencyLevel: {
+        type: String,
+        enum: ['critical', 'urgent', 'normal'],
+        default: 'urgent'
+    },
+    location: {
+        type: {
+            type: String,
+            enum: ['Point'],
+            default: 'Point'
+        },
+        coordinates: {
+            type: [Number]
+        }
+    },
+    address: {
+        street: String,
+        city: String,
+        state: String,
+        zipCode: String
+    },
+    contactPerson: {
+        name: String,
+        phone: String,
+        email: String
+    },
+    status: {
+        type: String,
+        enum: ['pending', 'matched', 'in-transit', 'delivered', 'cancelled'],
+        default: 'pending'
+    },
+    matchedDonors: [{
+        donor: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Donor'
+        },
+        status: {
+            type: String,
+            enum: ['contacted', 'accepted', 'declined', 'completed']
+        },
+        contactedAt: Date,
+        respondedAt: Date
+    }],
+    deliveryDetails: {
+        courierService: String,
+        trackingId: String,
+        estimatedDelivery: Date,
+        actualDelivery: Date
+    },
+    createdAt: {
+        type: Date,
+        default: Date.now
+    },
+    neededBy: {
+        type: Date,
+        required: true
+    }
+});
+
+module.exports = mongoose.model('Request', requestSchema);
+5. src/controllers/donorController.js:
+
+javascript
+const Donor = require('../models/Donor');
+const geolib = require('geolib');
+
+// @desc    Get nearby donors
+// @route   GET /api/donors/nearby
+// @access  Public
+exports.getNearbyDonors = async (req, res) => {
+    try {
+        const { latitude, longitude, bloodGroup, radius = 50 } = req.query;
+        
+        if (!latitude || !longitude) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Please provide latitude and longitude' 
+            });
+        }
+
+        // Convert radius from km to meters
+        const maxDistance = radius * 1000;
+
+        // Find donors within radius
+        const donors = await Donor.find({
+            bloodGroup: bloodGroup || { $exists: true },
+            isAvailable: true,
+            lastDonation: { 
+                $lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) 
+            },
+            location: {
+                $near: {
+                    $geometry: {
+                        type: 'Point',
+                        coordinates: [parseFloat(longitude), parseFloat(latitude)]
+                    },
+                    $maxDistance: maxDistance
+                }
+            }
+        }).select('-password');
+
+        // Calculate distance for each donor
+        const donorsWithDistance = donors.map(donor => {
+            const distance = geolib.getDistance(
+                { latitude, longitude },
+                { latitude: donor.location.coordinates[1], longitude: donor.location.coordinates[0] }
+            );
+            
+            return {
+                ...donor._doc,
+                distance: (distance / 1000).toFixed(1), // Convert to km
+                estimatedTime: Math.ceil(distance / 50000 * 60) // Rough estimate in minutes
+            };
+        });
+
+        // Sort by distance
+        donorsWithDistance.sort((a, b) => a.distance - b.distance);
+
+        res.status(200).json({
+            success: true,
+            count: donorsWithDistance.length,
+            data: donorsWithDistance
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+};
+
+// @desc    Register as donor
+// @route   POST /api/donors/register
+// @access  Public
+exports.registerDonor = async (req, res) => {
+    try {
+        const { 
+            name, email, phone, password, bloodGroup, 
+            age, weight, latitude, longitude, address 
+        } = req.body;
+
+        // Check if donor already exists
+        const donorExists = await Donor.findOne({ email });
+        if (donorExists) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Donor already exists' 
+            });
+        }
+
+        // Hash password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        // Create donor
+        const donor = await Donor.create({
+            name,
+            email,
+            phone,
+            password: hashedPassword,
+            bloodGroup,
+            age,
+            weight,
+            location: {
+                type: 'Point',
+                coordinates: [longitude, latitude]
+            },
+            address,
+            isAvailable: true
+        });
+
+        // Remove password from response
+        const donorResponse = donor.toObject();
+        delete donorResponse.password;
+
+        // Send verification email
+        // TODO: Implement email service
+
+        res.status(201).json({
+            success: true,
+            message: 'Donor registered successfully',
+            data: donorResponse
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+};
+6. src/controllers/requestController.js:
+
+javascript
+const Request = require('../models/Request');
+const Donor = require('../models/Donor');
+const { sendSMS, sendEmail } = require('../utils/notificationService');
+const axios = require('axios');
+
+// @desc    Create blood request
+// @route   POST /api/requests
+// @access  Public
+exports.createRequest = async (req, res) => {
+    try {
+        const requestData = req.body;
+
+        // Create request
+        const request = await Request.create(requestData);
+
+        // Find matching donors
+        const donors = await Donor.find({
+            bloodGroup: request.bloodGroup,
+            isAvailable: true,
+            lastDonation: { 
+                $lt: new Date(Date.now() - 90 * 24 * 60 * 60 * 1000) 
+            },
+            location: {
+                $near: {
+                    $geometry: request.location,
+                    $maxDistance: 50000 // 50km radius
+                }
+            }
+        }).limit(10);
+
+        // Contact donors
+        const contactedDonors = [];
+        for (const donor of donors) {
+            // Send notification based on preference
+            if (donor.preferredContactMethod === 'sms') {
+                await sendSMS(
+                    donor.phone,
+                    `URGENT: Blood needed for ${request.patientName}. ` +
+                    `Blood Group: ${request.bloodGroup}. ` +
+                    `Location: ${request.hospitalName}. ` +
+                    `Please respond if available.`
+                );
+            } else if (donor.preferredContactMethod === 'email') {
+                await sendEmail(
+                    donor.email,
+                    'Urgent Blood Donation Request',
+                    `A patient needs ${request.bloodGroup} blood at ${request.hospitalName}.`
+                );
+            }
+
+            contactedDonors.push({
+                donor: donor._id,
+                status: 'contacted',
+                contactedAt: new Date()
+            });
+        }
+
+        // Update request with contacted donors
+        request.matchedDonors = contactedDonors;
+        await request.save();
+
+        // Find logistics partner
+        const logisticsResponse = await axios.post('https://api.logistics.com/book', {
+            pickup: request.location,
+            delivery: donors[0]?.location, // Nearest donor
+            priority: request.urgencyLevel === 'critical' ? 'HIGH' : 'MEDIUM'
+        });
+
+        request.deliveryDetails = {
+            courierService: logisticsResponse.data.service,
+            trackingId: logisticsResponse.data.trackingId,
+            estimatedDelivery: logisticsResponse.data.eta
+        };
+        await request.save();
+
+        res.status(201).json({
+            success: true,
+            message: 'Request created and donors notified',
+            data: request,
+            donorsContacted: donors.length,
+            trackingId: logisticsResponse.data.trackingId
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+};
+
+// @desc    Track request status
+// @route   GET /api/requests/track/:trackingId
+// @access  Public
+exports.trackRequest = async (req, res) => {
+    try {
+        const { trackingId } = req.params;
+        
+        const request = await Request.findOne({ 
+            'deliveryDetails.trackingId': trackingId 
+        })
+        .populate('matchedDonors.donor', 'name phone bloodGroup');
+
+        if (!request) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Request not found' 
+            });
+        }
+
+        // Get real-time tracking from logistics API
+        const trackingResponse = await axios.get(
+            `https://api.logistics.com/track/${trackingId}`
+        );
+
+        res.status(200).json({
+            success: true,
+            data: {
+                request,
+                tracking: trackingResponse.data,
+                estimatedTime: request.deliveryDetails.estimatedDelivery
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+};
+7. src/utils/geolocation.js:
+
+javascript
+const axios = require('axios');
+
+// Convert address to coordinates
+exports.geocodeAddress = async (address) => {
+    try {
+        const response = await axios.get(
+            `https://maps.googleapis.com/maps/api/geocode/json`,
+            {
+                params: {
+                    address: address,
+                    key: process.env.GOOGLE_MAPS_API_KEY
+                }
+            }
+        );
+
+        if (response.data.results.length > 0) {
+            const location = response.data.results[0].geometry.location;
+            return {
+                latitude: location.lat,
+                longitude: location.lng,
+                formattedAddress: response.data.results[0].formatted_address
+            };
+        }
+        return null;
+    } catch (error) {
+        console.error('Geocoding error:', error);
+        return null;
+    }
+};
+
+// Calculate distance between two points
+exports.calculateDistance = (lat1, lon1, lat2, lon2) => {
+    const R = 6371; // Earth's radius in km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = 
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+        Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // Distance in km
+};
+8. src/app.js:
+
+javascript
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const connectDB = require('./config/database');
+const { errorHandler } = require('./middleware/errorHandler');
+
+// Load env vars
+dotenv.config();
+
+// Route files
+const authRoutes = require('./routes/authRoutes');
+const donorRoutes = require('./routes/donorRoutes');
+const requestRoutes = require('./routes/requestRoutes');
+
+// Connect to database
+connectDB();
+
+const app = express();
+
+// Body parser
+app.use(express.json());
+
+// Enable CORS
+app.use(cors());
+
+// Mount routers
+app.use('/api/auth', authRoutes);
+app.use('/api/donors', donorRoutes);
+app.use('/api/requests', requestRoutes);
+
+// Error handler
+app.use(errorHandler);
+
+const PORT = process.env.PORT || 5000;
+
+const server = app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (err, promise) => {
+    console.log(`Error: ${err.message}`);
+    server.close(() => process.exit(1));
+});
