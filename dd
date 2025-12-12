@@ -1,0 +1,296 @@
+backend/src/app.js (No Database Version):
+
+javascript
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs').promises;
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// In-memory storage (or JSON file)
+let donors = [];
+let requests = [];
+
+// Load initial data from JSON file
+async function loadData() {
+    try {
+        const donorsData = await fs.readFile(path.join(__dirname, 'data/donors.json'), 'utf8');
+        const requestsData = await fs.readFile(path.join(__dirname, 'data/requests.json'), 'utf8');
+        
+        donors = JSON.parse(donorsData);
+        requests = JSON.parse(requestsData);
+        console.log('📁 Data loaded from JSON files');
+    } catch (error) {
+        // If files don't exist, start with empty arrays
+        donors = [];
+        requests = [];
+        console.log('📁 Starting with empty data');
+    }
+}
+
+// Save data to JSON files
+async function saveData() {
+    try {
+        await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
+        await fs.writeFile(path.join(__dirname, 'data/donors.json'), JSON.stringify(donors, null, 2));
+        await fs.writeFile(path.join(__dirname, 'data/requests.json'), JSON.stringify(requests, null, 2));
+        console.log('💾 Data saved to JSON files');
+    } catch (error) {
+        console.error('Error saving data:', error);
+    }
+}
+
+// Load data on startup
+loadData();
+
+// ============ API ROUTES ============
+
+// Test API
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'Blood Donor API is running! (No Database Version)',
+        version: '1.0.0',
+        storage: 'JSON files',
+        endpoints: ['/api/donors', '/api/donors/register', '/api/requests', '/api/search']
+    });
+});
+
+// 1. GET ALL DONORS
+app.get('/api/donors', (req, res) => {
+    const availableDonors = donors.filter(d => d.isAvailable);
+    res.json({
+        success: true,
+        count: availableDonors.length,
+        data: availableDonors
+    });
+});
+
+// 2. REGISTER NEW DONOR
+app.post('/api/donors/register', (req, res) => {
+    try {
+        const donorData = req.body;
+        
+        // Generate unique ID
+        donorData.id = `DON${Date.now()}${Math.floor(Math.random() * 1000)}`;
+        donorData.isAvailable = true;
+        donorData.createdAt = new Date().toISOString();
+        
+        // Add to donors array
+        donors.push(donorData);
+        
+        // Save to file
+        saveData();
+        
+        res.json({
+            success: true,
+            message: 'Donor registered successfully!',
+            data: donorData
+        });
+    } catch (error) {
+        res.status(400).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// 3. CREATE BLOOD REQUEST
+app.post('/api/requests', (req, res) => {
+    try {
+        const requestData = req.body;
+        
+        // Generate unique ID
+        requestData.id = `REQ${Date.now()}${Math.floor(Math.random() * 1000)}`;
+        requestData.status = 'pending';
+        requestData.createdAt = new Date().toISOString();
+        
+        // Find matching donors
+        const matchingDonors = donors.filter(d => 
+            d.bloodGroup === requestData.bloodGroup && 
+            d.isAvailable === true
+        ).slice(0, 5); // Get first 5
+        
+        requestData.matchedDonors = matchingDonors.map(d => d.id);
+        
+        // Add to requests array
+        requests.push(requestData);
+        
+        // Save to file
+        saveData();
+        
+        res.json({
+            success: true,
+            message: 'Blood request created successfully!',
+            requestId: requestData.id,
+            matchedDonors: matchingDonors.length,
+            donors: matchingDonors.map(d => ({
+                name: d.name,
+                bloodGroup: d.bloodGroup,
+                phone: d.phone,
+                city: d.city
+            }))
+        });
+    } catch (error) {
+        res.status(400).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// 4. SEARCH DONORS
+app.get('/api/search', (req, res) => {
+    const { bloodGroup, city } = req.query;
+    
+    let filteredDonors = donors.filter(d => d.isAvailable === true);
+    
+    if (bloodGroup) {
+        filteredDonors = filteredDonors.filter(d => d.bloodGroup === bloodGroup);
+    }
+    
+    if (city) {
+        filteredDonors = filteredDonors.filter(d => 
+            d.city && d.city.toLowerCase().includes(city.toLowerCase())
+        );
+    }
+    
+    res.json({
+        success: true,
+        count: filteredDonors.length,
+        data: filteredDonors
+    });
+});
+
+// 5. GET ALL REQUESTS
+app.get('/api/requests', (req, res) => {
+    res.json({
+        success: true,
+        count: requests.length,
+        data: requests
+    });
+});
+
+// 6. GET STATISTICS
+app.get('/api/stats', (req, res) => {
+    const totalDonors = donors.length;
+    const availableDonors = donors.filter(d => d.isAvailable).length;
+    const totalRequests = requests.length;
+    const pendingRequests = requests.filter(r => r.status === 'pending').length;
+    
+    // Blood group distribution
+    const bloodGroups = {};
+    donors.forEach(donor => {
+        bloodGroups[donor.bloodGroup] = (bloodGroups[donor.bloodGroup] || 0) + 1;
+    });
+    
+    res.json({
+        success: true,
+        data: {
+            totalDonors,
+            availableDonors,
+            totalRequests,
+            pendingRequests,
+            bloodGroups: Object.entries(bloodGroups).map(([group, count]) => ({
+                _id: group,
+                count
+            }))
+        }
+    });
+});
+
+// 7. ADD SAMPLE DATA (For testing)
+app.post('/api/add-sample-data', (req, res) => {
+    const sampleDonors = [
+        {
+            id: 'DON1001',
+            name: 'John Smith',
+            email: 'john@example.com',
+            phone: '+1234567890',
+            bloodGroup: 'O+',
+            age: 28,
+            city: 'New York',
+            isAvailable: true,
+            createdAt: new Date().toISOString()
+        },
+        {
+            id: 'DON1002',
+            name: 'Sarah Johnson',
+            email: 'sarah@example.com',
+            phone: '+1234567891',
+            bloodGroup: 'A+',
+            age: 32,
+            city: 'Los Angeles',
+            isAvailable: true,
+            createdAt: new Date().toISOString()
+        },
+        {
+            id: 'DON1003',
+            name: 'Mike Williams',
+            email: 'mike@example.com',
+            phone: '+1234567892',
+            bloodGroup: 'B+',
+            age: 25,
+            city: 'Chicago',
+            isAvailable: true,
+            createdAt: new Date().toISOString()
+        },
+        {
+            id: 'DON1004',
+            name: 'Emma Davis',
+            email: 'emma@example.com',
+            phone: '+1234567893',
+            bloodGroup: 'O-',
+            age: 30,
+            city: 'Miami',
+            isAvailable: true,
+            createdAt: new Date().toISOString()
+        }
+    ];
+    
+    donors = [...donors, ...sampleDonors];
+    saveData();
+    
+    res.json({
+        success: true,
+        message: 'Sample donors added',
+        count: sampleDonors.length
+    });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`🚀 Backend Server running at: http://localhost:${PORT}`);
+    console.log(`📁 Storage: JSON files (no database needed)`);
+    console.log(`📊 Add sample data: POST http://localhost:${PORT}/api/add-sample-data`);
+});
+backend/package.json (Simplified):
+
+json
+{
+  "name": "blood-donor-backend",
+  "version": "1.0.0",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
+backend/.env (Simplified):
+
+env
+PORT=5000
+# No database needed!
